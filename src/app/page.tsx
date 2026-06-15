@@ -1,6 +1,7 @@
 'use client'
 
-import { useCallback, useEffect, useMemo, useState } from 'react'
+import { useEffect, useMemo, useState } from 'react'
+import { supabase, type VoteRow } from '@/lib/supabase'
 
 const NAMES = ['엄마', '도유유', '부채리', '하티지']
 const NAME_COLORS: Record<string, string> = {
@@ -10,7 +11,6 @@ const NAME_COLORS: Record<string, string> = {
   '하티지': '#FFB020',
 }
 const WEEKDAYS = ['일', '월', '화', '수', '목', '금', '토']
-const VOTES_KEY = 'getdon_votes'
 
 type Votes = Record<string, string[]>
 
@@ -239,6 +239,7 @@ export default function Home() {
   const [name, setName] = useState<string | null>(null)
   const [votes, setVotes] = useState<Votes>({})
   const [mounted, setMounted] = useState(false)
+  const [loading, setLoading] = useState(true)
 
   const [count, setCount] = useState(4)
   const [gameType, setGameType] = useState<'ladder' | 'button'>('ladder')
@@ -247,33 +248,131 @@ export default function Home() {
 
   useEffect(() => {
     setMounted(true)
-    try {
-      setVotes(JSON.parse(localStorage.getItem(VOTES_KEY) || '{}'))
-    } catch {}
   }, [])
 
-  const persist = (v: Votes) => {
-    setVotes(v)
-    try { localStorage.setItem(VOTES_KEY, JSON.stringify(v)) } catch {}
-  }
+  // 선택한 월의 투표를 Supabase에서 로드 + Realtime 구독
+  useEffect(() => {
+    let alive = true
+    setLoading(true)
 
-  const toggleVote = (date: string) => {
+    async function load() {
+      const { data, error } = await supabase
+        .from('getdon_votes')
+        .select('date, name')
+        .eq('month', month)
+      if (!alive) return
+      if (error) {
+        console.error('투표 로드 실패:', error.message)
+        setLoading(false)
+        return
+      }
+      const v: Votes = {}
+      ;(data as Pick<VoteRow, 'date' | 'name'>[]).forEach(({ date, name }) => {
+        if (!v[date]) v[date] = []
+        if (!v[date].includes(name)) v[date].push(name)
+      })
+      setVotes(v)
+      setLoading(false)
+    }
+    load()
+
+    // 같은 월 변경사항만 실시간 반영
+    const channel = supabase
+      .channel(`getdon_votes_${month}`)
+      .on(
+        'postgres_changes',
+        { event: '*', schema: 'public', table: 'getdon_votes', filter: `month=eq.${month}` },
+        payload => {
+          setVotes(prev => {
+            const next: Votes = { ...prev }
+            if (payload.eventType === 'INSERT') {
+              const { date, name } = payload.new as VoteRow
+              const arr = next[date] ? [...next[date]] : []
+              if (!arr.includes(name)) arr.push(name)
+              next[date] = arr
+            } else if (payload.eventType === 'DELETE') {
+              const { date, name } = payload.old as VoteRow
+              if (next[date]) {
+                const arr = next[date].filter(n => n !== name)
+                if (arr.length) next[date] = arr
+                else delete next[date]
+              }
+            }
+            return next
+          })
+        }
+      )
+      .subscribe()
+
+    return () => {
+      alive = false
+      supabase.removeChannel(channel)
+    }
+  }, [month])
+
+  // 투표 토글 — Supabase에 즉시 반영 (낙관적 업데이트 + 실패 시 롤백)
+  const toggleVote = async (date: string) => {
     if (!name) return
-    const v: Votes = { ...votes }
-    const arr = v[date] ? [...v[date]] : []
-    const idx = arr.indexOf(name)
-    if (idx >= 0) arr.splice(idx, 1)
-    else arr.push(name)
-    if (arr.length) v[date] = arr
-    else delete v[date]
-    persist(v)
+    const has = (votes[date] || []).includes(name)
+
+    // 낙관적 업데이트
+    setVotes(prev => {
+      const v: Votes = { ...prev }
+      const arr = v[date] ? [...v[date]] : []
+      const idx = arr.indexOf(name)
+      if (idx >= 0) arr.splice(idx, 1)
+      else arr.push(name)
+      if (arr.length) v[date] = arr
+      else delete v[date]
+      return v
+    })
+
+    if (has) {
+      const { error } = await supabase
+        .from('getdon_votes')
+        .delete()
+        .eq('date', date)
+        .eq('name', name)
+      if (error) {
+        console.error('투표 취소 실패:', error.message)
+        // 롤백
+        setVotes(prev => {
+          const v: Votes = { ...prev }
+          const arr = v[date] ? [...v[date]] : []
+          if (!arr.includes(name)) arr.push(name)
+          v[date] = arr
+          return v
+        })
+      }
+    } else {
+      const { error } = await supabase
+        .from('getdon_votes')
+        .insert({ month, date, name })
+      if (error) {
+        console.error('투표 실패:', error.message)
+        // 롤백
+        setVotes(prev => {
+          const v: Votes = { ...prev }
+          const arr = (v[date] || []).filter(n => n !== name)
+          if (arr.length) v[date] = arr
+          else delete v[date]
+          return v
+        })
+      }
+    }
   }
 
-  const resetVotes = () => {
-    if (confirm('이 달의 모든 투표를 초기화할까요?')) {
-      const v: Votes = { ...votes }
-      daysOf(month).forEach(d => delete v[d])
-      persist(v)
+  const resetVotes = async () => {
+    if (!confirm('이 달의 모든 투표를 초기화할까요? (모든 참가자 투표가 삭제됩니다)')) return
+    const prev = votes
+    setVotes({}) // 낙관적
+    const { error } = await supabase
+      .from('getdon_votes')
+      .delete()
+      .eq('month', month)
+    if (error) {
+      console.error('초기화 실패:', error.message)
+      setVotes(prev) // 롤백
     }
   }
 
@@ -312,7 +411,14 @@ export default function Home() {
 
       {/* 캘린더 카드 */}
       <section style={styles.card}>
-        <div style={styles.cardLabel}>📅 모임 날짜 정하기</div>
+        <div style={styles.cardLabelRow}>
+          <span style={styles.cardLabel}>📅 모임 날짜 정하기</span>
+          {mounted && (
+            <span style={styles.liveBadge}>
+              <span style={styles.liveDot} />실시간
+            </span>
+          )}
+        </div>
 
         {/* 월 선택 */}
         <div style={styles.monthRow}>
@@ -355,7 +461,7 @@ export default function Home() {
             <div key={w} style={{ ...styles.weekCell, color: i === 0 ? '#FF6B6B' : i === 6 ? '#4A9EFF' : '#ADB5BD' }}>{w}</div>
           ))}
         </div>
-        <div style={styles.grid}>
+        <div style={{ ...styles.grid, opacity: loading ? 0.5 : 1, transition: 'opacity .2s' }}>
           {Array.from({ length: totalCells }).map((_, i) => {
             const di = i - fdow
             if (di < 0 || di >= days.length) return <div key={'e' + i} style={{ aspectRatio: '1' }} />
@@ -405,7 +511,7 @@ export default function Home() {
             <div style={styles.confirmCount}>{confirmed.count}명</div>
           </div>
         ) : (
-          <div style={styles.emptyBanner}>아직 선택된 날짜가 없어요</div>
+          <div style={styles.emptyBanner}>{loading ? '불러오는 중...' : '아직 선택된 날짜가 없어요'}</div>
         )}
 
         <button style={styles.resetVotesBtn} onClick={resetVotes}>이 달 투표 초기화</button>
@@ -488,6 +594,17 @@ const styles: Record<string, React.CSSProperties> = {
     gap: 14,
   },
   cardLabel: { fontSize: 16, fontWeight: 800, color: '#212529' },
+  cardLabelRow: { display: 'flex', alignItems: 'center', justifyContent: 'space-between' },
+  liveBadge: {
+    display: 'inline-flex', alignItems: 'center', gap: 5,
+    fontSize: 11, fontWeight: 700, color: '#00C471',
+    background: '#E9FBF3', borderRadius: 20, padding: '3px 9px',
+  },
+  liveDot: {
+    width: 7, height: 7, borderRadius: '50%', background: '#00C471',
+    boxShadow: '0 0 0 0 rgba(0,196,113,.6)',
+    animation: 'gdPop 1s ease',
+  },
   // 월
   monthRow: { display: 'grid', gridTemplateColumns: 'repeat(6,1fr)', gap: 6 },
   monthBtn: { borderRadius: 10, padding: '9px 0', fontSize: 12, border: 'none', cursor: 'pointer', transition: 'all .12s' },
